@@ -28,6 +28,13 @@ else  # t4
 fi
 export VLLM_GPU_MEM_UTIL VLLM_MAX_LEN VLLM_BNB
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# Cloud containers cap processes/threads (ulimit -u / cgroup pids); OpenMP +
+# tokenizers + dataloader workers blow past it -> "libgomp: Thread creation
+# failed" + segfault. Cap thread spawning and bump the limit best-effort.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-8}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+ulimit -u 64000 2>/dev/null || true
 echo "GPU_PROFILE=$GPU_PROFILE  teacher(b=$TEACHER_BATCH a=$TEACHER_ACCUM L=$TEACHER_MAXLEN)  student(b=$STUDENT_BATCH a=$STUDENT_ACCUM L=$STUDENT_MAXLEN)  vllm(util=$VLLM_GPU_MEM_UTIL bnb=$VLLM_BNB)"
 
 DATA=train/data

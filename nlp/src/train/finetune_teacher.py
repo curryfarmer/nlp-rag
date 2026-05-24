@@ -82,6 +82,7 @@ def main() -> int:
                     learning_rate=args.lr, warmup_ratio=0.03, lr_scheduler_type="cosine",
                     logging_steps=10, save_strategy="epoch",
                     bf16=bf16_ok, fp16=not bf16_ok,
+                    dataloader_num_workers=0,  # avoid container thread/pids cap
                     max_length=args.max_seq_len, gradient_checkpointing=True)
 
     trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds,
