@@ -21,13 +21,20 @@ if [ "$GPU_PROFILE" = "5090" ]; then
     # NB: Qwen2.5 has a 152k vocab -> the loss logits tensor is batch*seq*152k.
     # Big batch OOMs even 32GB (batch8*seq2048 logits+upcast ~= 9GB+). Keep
     # batch*seq modest; grad-accum recovers effective batch.
+    # max_length MUST exceed prompt+answer or SFTTrainer truncates the gold
+    # answer off the end (it lives last) -> student learns doc-continuation, not
+    # QA. With _MAX_DOC_CHARS=4000 examples top out ~3225 tok, so 4096 keeps every
+    # answer. seq doubled vs 2048 -> halve batch (logits = batch*seq*152k vocab is
+    # the OOM driver) and double accum to hold effective batch.
     : "${VLLM_GPU_MEM_UTIL:=0.90}"; : "${VLLM_MAX_LEN:=8192}"; : "${VLLM_BNB:=0}"
-    : "${TEACHER_BATCH:=2}";  : "${TEACHER_ACCUM:=8}";  : "${TEACHER_MAXLEN:=2048}"
-    : "${STUDENT_BATCH:=4}";  : "${STUDENT_ACCUM:=4}";  : "${STUDENT_MAXLEN:=2048}"
+    : "${TEACHER_BATCH:=1}";  : "${TEACHER_ACCUM:=16}"; : "${TEACHER_MAXLEN:=4096}"
+    : "${STUDENT_BATCH:=2}";  : "${STUDENT_ACCUM:=8}";  : "${STUDENT_MAXLEN:=4096}"
 else  # t4
     : "${VLLM_GPU_MEM_UTIL:=0.75}"; : "${VLLM_MAX_LEN:=4096}"; : "${VLLM_BNB:=1}"
-    : "${TEACHER_BATCH:=1}";  : "${TEACHER_ACCUM:=16}"; : "${TEACHER_MAXLEN:=1024}"
-    : "${STUDENT_BATCH:=2}";  : "${STUDENT_ACCUM:=8}";  : "${STUDENT_MAXLEN:=1024}"
+    # 1024 truncated the answer off every example (same bug as 5090); 4096 keeps
+    # it. 16GB -> batch 1. Teacher 7B at 4096 likely OOMs on T4; use SKIP_TEACHER=1.
+    : "${TEACHER_BATCH:=1}";  : "${TEACHER_ACCUM:=16}"; : "${TEACHER_MAXLEN:=4096}"
+    : "${STUDENT_BATCH:=1}";  : "${STUDENT_ACCUM:=16}"; : "${STUDENT_MAXLEN:=4096}"
 fi
 export VLLM_GPU_MEM_UTIL VLLM_MAX_LEN VLLM_BNB
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"

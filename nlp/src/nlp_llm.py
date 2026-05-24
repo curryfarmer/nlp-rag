@@ -73,7 +73,14 @@ _FEWSHOT_COT = [
 
 _RE_ANSWER_LINE = re.compile(r"answer\s*:\s*(.+)", re.IGNORECASE | re.DOTALL)
 
-_MAX_DOC_CHARS = int(os.getenv("NLP_LLM_MAX_DOC_CHARS", "10000"))
+# Per-doc context cap. MUST keep prompt+answer under the trainer's max_length:
+# at 10000 every SFT example was ~5000+ tokens > the 2048 cap, so SFTTrainer
+# right-truncated the trailing gold answer off EVERY example -> the student
+# trained pure doc-continuation (token-acc 0.998, but F1 0.024 at inference).
+# 4000 chars * 3 docs + prompt ~= 3200 tokens, fits a 4096 max_length with the
+# answer intact, and still keeps ~82% of verbatim answer spans in-context.
+# prepare_data.py imports this same constant, so train==inference stays in sync.
+_MAX_DOC_CHARS = int(os.getenv("NLP_LLM_MAX_DOC_CHARS", "4000"))
 _MAX_NEW_TOKENS = int(os.getenv("NLP_LLM_MAX_NEW", "128"))
 
 
