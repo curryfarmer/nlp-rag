@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -52,9 +53,18 @@ def _load_docs() -> list[dict[str, str]]:
 def _load_teacher(model_id: str):
     """Lazy load. Prefer vLLM for throughput; fall back to transformers."""
     try:
-        from vllm import LLM, SamplingParams  # noqa: F401
-        return ("vllm", LLM(model=model_id, dtype="auto"))
-    except Exception:
+        from vllm import LLM  # noqa: F401
+        # Shared T4: cap VRAM share so we coexist with other jobs, and load the
+        # 7B in 4-bit (bitsandbytes) so it fits ~8GB instead of ~14GB fp16.
+        util = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.55"))
+        maxlen = int(os.getenv("VLLM_MAX_LEN", "8192"))
+        kw = dict(gpu_memory_utilization=util, max_model_len=maxlen, dtype="auto")
+        if os.getenv("VLLM_BNB", "1") == "1":
+            kw.update(quantization="bitsandbytes", load_format="bitsandbytes")
+        return ("vllm", LLM(model=model_id, **kw))
+    except Exception as e:  # noqa: BLE001
+        print(f"[synth] vllm unavailable ({type(e).__name__}: {e}); HF 4-bit fallback",
+              file=sys.stderr)
         from transformers import (AutoModelForCausalLM, AutoTokenizer,
                                   BitsAndBytesConfig)
         import torch

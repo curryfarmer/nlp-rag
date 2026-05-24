@@ -8,10 +8,21 @@ set -euo pipefail
 TEACHER="${TEACHER:-Qwen/Qwen2.5-7B-Instruct}"
 STUDENT="${STUDENT:-Qwen/Qwen2.5-0.5B-Instruct}"
 PER_DOC="${PER_DOC:-6}"
+# vllm coexists with other jobs on the shared T4: cap its VRAM share + 4-bit load.
+export VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.55}"
+export VLLM_BNB="${VLLM_BNB:-1}"
 DATA=train/data
 CKPT=train/ckpt
 ART=train/artifacts
 mkdir -p "$DATA" "$CKPT" "$ART"
+
+echo "== deps =="
+pip install -q -r ../requirements-train.txt
+# vllm makes synth ~10-20min instead of hours. It may upgrade torch — if that
+# breaks QLoRA/bitsandbytes, set SKIP_VLLM=1 and gen_synthetic falls back to HF 4-bit.
+if [ "${SKIP_VLLM:-0}" != "1" ]; then
+    pip install -q vllm || echo "vllm install failed -> HF 4-bit fallback for synth"
+fi
 
 echo "== A: baseline proxy (regex-only) =="
 python eval_answers.py --proxy-bem | tail -8
