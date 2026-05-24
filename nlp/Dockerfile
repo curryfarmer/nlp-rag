@@ -22,11 +22,11 @@ COPY src .
 ENV HF_HUB_OFFLINE=1
 ENV TRANSFORMERS_OFFLINE=1
 
-# Answer mode. Default = regex-only (no model needed, fully offline).
-# To serve the distilled student instead: drop its weights in models/student,
-# then uncomment the three lines below (NLP_LLM_MODEL is relative to /workspace).
-# ENV NLP_USE_LLM=1
-# ENV NLP_LLM_MODEL=models/student
-# ENV NLP_LLM_TOP_K=3
+# Answer mode = distilled student (weights baked into models/student).
+# NLP_LLM_MODEL is relative to /workspace. To fall back to regex-only (no model,
+# higher current score ~0.759), comment these three out again.
+ENV NLP_USE_LLM=1
+ENV NLP_LLM_MODEL=models/student
+ENV NLP_LLM_TOP_K=3
 
 CMD uvicorn nlp_server:app --port 5004 --host 0.0.0.0
