@@ -1,10 +1,7 @@
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
-asyncio
-transformers
-accelerate
-bitsandbytes
-sentence-transformers
-tiktoken
-nltk
-sentencepiece
+# Phase 3 reranker — optional, only used when NLP_USE_RERANK=1
+sentence-transformers>=2.7
+transformers>=4.40
+torch>=2.0
+numpy>=1.24

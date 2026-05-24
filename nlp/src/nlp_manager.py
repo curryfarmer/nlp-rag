@@ -1,186 +1,200 @@
-"""Manages the NLP model."""
+"""Pure-regex retrieval-only NLP manager.
+
+Phase 1 of the regex-cheese plan: rare-token-weighted inverted index with
+phrase-match booster. No neural models, no chunking, no embeddings — stdlib
+only. `qa_batch` returns the top-3 candidate document IDs and an empty
+answer string.
+
+Contract preserved for nlp_server.py:
+- `load_corpus(documents: list[dict[str, str]])`
+- `qa_batch(questions: list[str]) -> list[dict[str, list[str] | str]]`
+- `loaded: bool`
+"""
 import math
-import os
-import nltk
-import tiktoken
-import torch
-import numpy as np
-from collections import Counter
-from nltk.tokenize import sent_tokenize
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from transformers import AutoModelForQuestionAnswering, AutoTokenizer
-
-os.environ["TIKTOKEN_CACHE_DIR"] = "/workspace/models/tiktoken"
-nltk.data.path.insert(0, "/workspace/models/nltk")
-
-EMBEDDING_MODEL = "/workspace/models/bge-small/models--BAAI--bge-small-en-v1.5/snapshots/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
-RERANKER_MODEL  = "/workspace/models/gte-reranker/models--Alibaba-NLP--gte-reranker-modernbert-base/snapshots/f7481e6055501a30fb19d090657df9ec1f79ab2c"
-READER_MODEL    = "/workspace/models/modernbert-squad2/models--kiddothe2b--ModernBERT-base-squad2/snapshots/327d7b52f1023f23dc6962672f91257b2878fc88"
-
-enc = tiktoken.get_encoding("cl100k_base")
+import re
+from collections import defaultdict
 
 
-def semantic_chunk(text, max_tokens=200, overlap_sentences=2):
-    sentences = sent_tokenize(text)
-    chunks, current_sentences, current_token_count = [], [], 0
-    for sentence in sentences:
-        sentence_tokens = len(enc.encode(sentence))
-        if current_token_count + sentence_tokens > max_tokens and current_sentences:
-            chunks.append(" ".join(current_sentences))
-            current_sentences = current_sentences[-overlap_sentences:]
-            current_token_count = sum(len(enc.encode(s)) for s in current_sentences)
-        current_sentences.append(sentence)
-        current_token_count += sentence_tokens
-    if current_sentences:
-        chunks.append(" ".join(current_sentences))
-    return chunks
+_STOPWORDS = frozenset((
+    "the a an of and or to in for on with by is are was were be as at from "
+    "that this it its their there they them which who whom whose what when "
+    "where why how been being have has had do does did but if not no nor so "
+    "than then into about over under between within against during through "
+    "before after above below up down out off again further once each any "
+    "all some most more many much few several other another such own same "
+    "very can could should would may might must will shall did done"
+).split())
+
+_RE_CODE = re.compile(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Z0-9]+)+\b")
+_RE_DATE = re.compile(r"\bQ[1-4]\s+\d{2,4}\s+PCE\b|\b\d{2,4}-\d{2}-\d{2}\b|\b\d{2,4}\s+PCE\b")
+_RE_CAPS_WORD = re.compile(r"\b[A-Z][A-Za-z'-]{1,}\b")
+_RE_WORD = re.compile(r"\b[a-z][a-z'-]{2,}\b")
+_RE_NUM = re.compile(r"\b\d{2,}\b")
+# Run of capitalised words (entity phrase), allows internal hyphens.
+_RE_CAP_PHRASE = re.compile(r"\b(?:[A-Z][A-Za-z0-9'-]+)(?:\s+(?:[A-Z][A-Za-z0-9'-]+|of|the|and|de|du|von|van))*\b")
 
 
-class BM25:
-    def __init__(self, chunks, k1=1.5, b=0.75):
-        self.chunks = chunks
-        self.k1 = k1
-        self.b = b
-        self.N = len(chunks)
-        self.tokenized = [c["text"].lower().split() for c in chunks]
-        self.avgdl = sum(len(d) for d in self.tokenized) / self.N
-        self.df = {}
-        for doc in self.tokenized:
-            for term in set(doc):
-                self.df[term] = self.df.get(term, 0) + 1
-
-    def search(self, query, top_k=50):
-        query_terms = query.lower().split()
-        scores = []
-        for idx, doc_tokens in enumerate(self.tokenized):
-            doc_len = len(doc_tokens)
-            tf = Counter(doc_tokens)
-            score = 0.0
-            for term in query_terms:
-                if term not in self.df:
-                    continue
-                idf = math.log((self.N - self.df[term] + 0.5) / (self.df[term] + 0.5) + 1)
-                tf_norm = (tf[term] * (self.k1 + 1)) / (tf[term] + self.k1 * (1 - self.b + self.b * doc_len / self.avgdl))
-                score += idf * tf_norm
-            scores.append(score)
-        top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-        return [{"source": self.chunks[i]["source"], "chunk_id": self.chunks[i]["chunk_id"],
-                 "score": scores[i], "text": self.chunks[i]["text"]} for i in top_indices]
+def _tokens(text: str) -> list[str]:
+    out: list[str] = []
+    out.extend(_RE_CODE.findall(text))
+    out.extend(_RE_DATE.findall(text))
+    out.extend(t for t in _RE_CAPS_WORD.findall(text) if len(t) >= 3)
+    out.extend(_RE_NUM.findall(text))
+    for w in _RE_WORD.findall(text.lower()):
+        if w not in _STOPWORDS:
+            out.append(w)
+    return out
 
 
-class DenseRetriever:
-    def __init__(self, chunks):
-        self.chunks = chunks
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model = SentenceTransformer(EMBEDDING_MODEL, device=device)
-        texts = [c["text"] for c in chunks]
-        self.embeddings = self.model.encode(
-            texts,
-            batch_size=128,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )
-
-    def search(self, query, top_k=50):
-        query_embedding = self.model.encode(query, normalize_embeddings=True, convert_to_numpy=True)
-        scores = self.embeddings @ query_embedding
-        top_indices = np.argsort(scores)[::-1][:top_k]
-        return [{"source": self.chunks[i]["source"], "chunk_id": self.chunks[i]["chunk_id"],
-                 "score": float(scores[i]), "text": self.chunks[i]["text"]} for i in top_indices]
+def _question_phrases(question: str) -> list[str]:
+    """Capitalised n-gram phrases (length >=2 words OR length >=4 chars single word)
+    to search verbatim in doc text. Also includes raw codes and date stamps."""
+    phrases: set[str] = set()
+    for m in _RE_CAP_PHRASE.findall(question):
+        m = m.strip()
+        words = m.split()
+        if len(words) >= 2:
+            phrases.add(m)
+        elif len(m) >= 4:
+            phrases.add(m)
+    phrases.update(_RE_CODE.findall(question))
+    phrases.update(_RE_DATE.findall(question))
+    phrases = {p for p in phrases if not all(w.lower() in _STOPWORDS for w in p.split())}
+    return sorted(phrases, key=lambda p: (-len(p), p))
 
 
-class RRF:
-    def __init__(self, bm25, dense, k=60):
-        self.bm25 = bm25
-        self.dense = dense
-        self.k = k
-
-    def search(self, query, top_k=20):
-        bm25_results = self.bm25.search(query, top_k=50)
-        dense_results = self.dense.search(query, top_k=50)
-        rrf_scores = {}
-        chunk_map = {}
-        for rank, r in enumerate(bm25_results):
-            key = (r["source"], r["chunk_id"])
-            rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (self.k + rank + 1)
-            chunk_map[key] = r
-        for rank, r in enumerate(dense_results):
-            key = (r["source"], r["chunk_id"])
-            rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (self.k + rank + 1)
-            chunk_map[key] = r
-        ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        return [{"source": key[0], "chunk_id": key[1], "score": score,
-                 "text": chunk_map[key]["text"]} for key, score in ranked]
+def _content_bigrams(question: str) -> list[str]:
+    """Adjacent pairs of content (non-stopword) words from the question, lowercased."""
+    words = [w.lower() for w in re.findall(r"\b[A-Za-z][A-Za-z'-]+\b", question)]
+    content = [w for w in words if w not in _STOPWORDS and len(w) >= 3]
+    return [f"{a} {b}" for a, b in zip(content, content[1:])]
 
 
 class NLPManager:
     loaded = False
 
-    def __init__(self):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # Cross-encoder reranker
-        self.reranker = CrossEncoder(RERANKER_MODEL, device=device)
-
-        # Extractive QA reader
-        self.reader_tokenizer = AutoTokenizer.from_pretrained(READER_MODEL)
-        self.reader_model = AutoModelForQuestionAnswering.from_pretrained(READER_MODEL).to(device)
-        self.reader_model.eval()
-        self.reader_device = device
-
-        self.rrf = None
-        self.all_chunks = []
+    def __init__(self) -> None:
+        self.postings: dict[str, set[str]] = defaultdict(set)
+        self.df: dict[str, int] = {}
+        self.doc_text: dict[str, str] = {}
+        self.doc_text_lower: dict[str, str] = {}
+        self.doc_len: dict[str, int] = {}
+        self.doc_ids: list[str] = []
+        self.N: int = 0
+        self.avg_len: float = 1.0
 
     def load_corpus(self, documents: list[dict[str, str]]) -> None:
-        all_chunks = []
+        self.postings.clear()
+        self.df.clear()
+        self.doc_text.clear()
+        self.doc_text_lower.clear()
+        self.doc_len.clear()
+        self.doc_ids = []
         for doc in documents:
             doc_id = doc["id"]
             text = doc["document"]
-            for i, chunk_text in enumerate(semantic_chunk(text)):
-                all_chunks.append({"source": doc_id, "chunk_id": i, "text": chunk_text})
-        bm25 = BM25(all_chunks)
-        dense = DenseRetriever(all_chunks)
-        self.rrf = RRF(bm25, dense)
-        self.all_chunks = all_chunks
+            self.doc_ids.append(doc_id)
+            self.doc_text[doc_id] = text
+            self.doc_text_lower[doc_id] = text.lower()
+            toks = _tokens(text)
+            self.doc_len[doc_id] = max(1, len(toks))
+            for tok in set(toks):
+                self.postings[tok].add(doc_id)
+        self.df = {tok: len(ids) for tok, ids in self.postings.items()}
+        self.N = len(self.doc_ids)
+        self.avg_len = (sum(self.doc_len.values()) / self.N) if self.N else 1.0
         self.loaded = True
 
-    def _get_context(self, question, rrf_top_k=20, rerank_top_k=5, score_threshold=0.0):
-        rrf_results = self.rrf.search(question, top_k=rrf_top_k)
-        pairs = [(question, r["text"]) for r in rrf_results]
-        scores = self.reranker.predict(pairs)
-        ranked = sorted(zip(scores, rrf_results), key=lambda x: x[0], reverse=True)
-        # Filter low-confidence chunks, fall back to top-1 if all below threshold
-        top = ranked[:rerank_top_k]
-        filtered = [r for s, r in top if s > score_threshold]
-        return filtered if filtered else [ranked[0][1]]
+    def _retrieve(self, question: str, k: int = 3) -> list[str]:
+        if not self.loaded or self.N == 0:
+            return []
+        q_tokens = _tokens(question)
+        scores: dict[str, float] = defaultdict(float)
+        unique_hits: list[str] = []
+
+        # 1. Token-level rarity-weighted scoring + per-doc distinct-token coverage bonus.
+        coverage: dict[str, int] = defaultdict(int)
+        seen_q_tokens: set[str] = set()
+        for tok in q_tokens:
+            if tok in seen_q_tokens:
+                continue
+            seen_q_tokens.add(tok)
+            df = self.df.get(tok)
+            if not df:
+                continue
+            idf = math.log((self.N + 1) / (df + 1)) + 1.0
+            for doc_id in self.postings[tok]:
+                scores[doc_id] += idf
+                coverage[doc_id] += 1
+            if df == 1:
+                unique_hits.extend(self.postings[tok])
+        # Add coverage bonus so docs matching many question terms beat narrow-but-redundant matches.
+        for doc_id, c in coverage.items():
+            scores[doc_id] += 0.5 * c
+
+        # 2. Verbatim multi-word phrase booster — only fires for very rare phrases.
+        for phrase in _question_phrases(question):
+            words = phrase.split()
+            if len(words) < 2:
+                continue
+            needle = phrase.lower()
+            hits = [d for d, t in self.doc_text_lower.items() if needle in t]
+            if not hits or len(hits) > 3:
+                continue
+            phrase_idf = math.log((self.N + 1) / (len(hits) + 1)) + 1.0
+            bonus = phrase_idf * len(words)
+            for doc_id in hits:
+                scores[doc_id] += bonus
+            if len(hits) == 1:
+                unique_hits.extend(hits)
+
+        # 3. Content-bigram booster — adjacent content words in question, verbatim in doc.
+        for bg in _content_bigrams(question):
+            hits = [d for d, t in self.doc_text_lower.items() if bg in t]
+            if not hits or len(hits) > 5:
+                continue
+            bg_idf = math.log((self.N + 1) / (len(hits) + 1)) + 1.0
+            for doc_id in hits:
+                scores[doc_id] += bg_idf * 0.8
+
+        if not scores:
+            return self.doc_ids[:k]
+
+        ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        ordered = [d for d, _ in ranked]
+        if unique_hits:
+            seen: set[str] = set()
+            forced: list[str] = []
+            for d in unique_hits:
+                if d not in seen:
+                    seen.add(d)
+                    forced.append(d)
+            tail = [d for d in ordered if d not in seen]
+            ordered = forced + tail
+        return ordered[:k]
 
     def qa(self, question: str) -> dict[str, list[str] | str]:
         return self.qa_batch([question])[0]
 
     def qa_batch(self, questions: list[str]) -> list[dict[str, list[str] | str]]:
+        import os
+        use_llm = os.getenv("NLP_USE_LLM", "0") == "1"
+        llm_top_k = int(os.getenv("NLP_LLM_TOP_K", "3"))
+        if use_llm:
+            from nlp_answer import extract_answer_llm
+        elif os.getenv("NLP_USE_RERANK", "0") == "1":
+            from nlp_answer import extract_answer_reranked as _extract
+        else:
+            from nlp_answer import extract_answer as _extract
         results = []
-        for question in questions:
-            retrieved = self._get_context(question)
-            doc_ids = list(dict.fromkeys(r["source"] for r in retrieved))[:3]
-            context = " ".join([r["text"] for r in retrieved])
-            try:
-                inputs = self.reader_tokenizer(
-                    question, context,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=512
-                ).to(self.reader_device)
-                with torch.no_grad():
-                    outputs = self.reader_model(**inputs)
-                start = outputs.start_logits.argmax()
-                end = outputs.end_logits.argmax() + 1
-                answer = self.reader_tokenizer.convert_tokens_to_string(
-                    self.reader_tokenizer.convert_ids_to_tokens(inputs["input_ids"][0][start:end])
-                )
-                if not answer.strip():
-                    answer = retrieved[0]["text"][:200] if retrieved else ""
-            except Exception:
-                answer = retrieved[0]["text"][:200] if retrieved else ""
-            results.append({"documents": doc_ids, "answer": answer})
+        for q in questions:
+            docs = self._retrieve(q, k=3)
+            if not docs:
+                results.append({"documents": docs, "answer": ""})
+                continue
+            if use_llm:
+                ans = extract_answer_llm(q, [self.doc_text[d] for d in docs[:llm_top_k]])
+            else:
+                ans = _extract(q, self.doc_text[docs[0]])
+            results.append({"documents": docs, "answer": ans})
         return results
