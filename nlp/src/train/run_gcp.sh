@@ -10,7 +10,9 @@
 set -euo pipefail
 
 TEACHER="${TEACHER:-Qwen/Qwen2.5-7B-Instruct}"
-STUDENT="${STUDENT:-Qwen/Qwen2.5-0.5B-Instruct}"
+# 3B LoRA (fp16) beats the 0.5B on L2 composition and still fits 32GB; the 0.5B
+# distilled to est ~0.47 (below the 0.759 regex baseline) and scored L2 = 0.000.
+STUDENT="${STUDENT:-Qwen/Qwen2.5-3B-Instruct}"
 PER_DOC="${PER_DOC:-6}"
 GPU_PROFILE="${GPU_PROFILE:-5090}"
 

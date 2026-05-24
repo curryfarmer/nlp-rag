@@ -51,31 +51,45 @@ def _load_docs() -> list[dict[str, str]]:
 
 
 def _load_teacher(model_id: str):
-    """Lazy load. Prefer vLLM for throughput; fall back to transformers."""
-    try:
-        from vllm import LLM  # noqa: F401
-        # Shared T4: cap VRAM share so we coexist with other jobs, and load the
-        # 7B in 4-bit (bitsandbytes) so it fits ~8GB instead of ~14GB fp16.
-        util = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.55"))
-        maxlen = int(os.getenv("VLLM_MAX_LEN", "8192"))
-        kw = dict(gpu_memory_utilization=util, max_model_len=maxlen, dtype="auto")
-        if os.getenv("VLLM_BNB", "1") == "1":
-            kw.update(quantization="bitsandbytes", load_format="bitsandbytes")
-        return ("vllm", LLM(model=model_id, **kw))
-    except Exception as e:  # noqa: BLE001
-        print(f"[synth] vllm unavailable ({type(e).__name__}: {e}); HF 4-bit fallback",
-              file=sys.stderr)
-        from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                                  BitsAndBytesConfig)
-        import torch
-        tok = AutoTokenizer.from_pretrained(model_id)
-        # 4-bit load: a 7B teacher in fp16 (~14GB) OOMs a T4 (16GB) once 1024-tok
-        # activations land. nf4 brings it to ~5-6GB. Drop to fp16 on big GPUs.
+    """Lazy load. Prefer vLLM for throughput; fall back to transformers.
+
+    SKIP_VLLM=1 skips the vLLM attempt entirely (use it on Blackwell where
+    vLLM's flashinfer build fails on missing CUDA dev headers). VLLM_BNB=0 loads
+    the HF fallback in fp16/bf16 instead of 4-bit — bitsandbytes has no sm_120
+    kernels, and a 32GB card holds a 7B in fp16 (~14GB) with room to spare.
+    """
+    import torch
+    if os.getenv("SKIP_VLLM", "0") != "1":
+        try:
+            from vllm import LLM  # noqa: F401
+            util = float(os.getenv("VLLM_GPU_MEM_UTIL", "0.55"))
+            maxlen = int(os.getenv("VLLM_MAX_LEN", "8192"))
+            kw = dict(gpu_memory_utilization=util, max_model_len=maxlen, dtype="auto")
+            if os.getenv("VLLM_BNB", "1") == "1":
+                kw.update(quantization="bitsandbytes", load_format="bitsandbytes")
+            return ("vllm", LLM(model=model_id, **kw))
+        except Exception as e:  # noqa: BLE001
+            print(f"[synth] vllm unavailable ({type(e).__name__}: {e}); HF fallback",
+                  file=sys.stderr)
+    else:
+        print("[synth] SKIP_VLLM=1 -> HF backend", file=sys.stderr)
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model_id)
+    if os.getenv("VLLM_BNB", "1") == "1":
+        # T4 (16GB): nf4 4-bit brings a 7B to ~5-6GB. Needs bitsandbytes kernels.
+        from transformers import BitsAndBytesConfig
         bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                  bnb_4bit_compute_dtype=torch.float16)
         model = AutoModelForCausalLM.from_pretrained(
             model_id, quantization_config=bnb, device_map="auto")
-        return ("hf", (tok, model))
+    else:
+        # Big GPU: fp16/bf16, no bitsandbytes (no Blackwell kernels).
+        bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=(torch.bfloat16 if bf16_ok else torch.float16),
+            device_map="auto")
+    return ("hf", (tok, model))
 
 
 def _generate(backend, handle, prompt: str) -> str:

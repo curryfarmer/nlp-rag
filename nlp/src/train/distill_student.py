@@ -36,10 +36,21 @@ def load_jsonl(path: str):
 
 
 def _train_seq(args):
-    """Sequence-level KD == SFT on teacher-generated (and gold) chat data."""
+    """Sequence-level KD == SFT on teacher-generated (and gold) chat data.
+
+    LoRA over an fp16/bf16 base (NOT 4-bit), then merge_and_unload + save full
+    weights. Rationale:
+      - LoRA keeps the optimizer state tiny, so a 1.5B/3B student fits 32GB where
+        full fine-tune + the 152k-vocab loss logits would OOM.
+      - fp16 base (vs QLoRA 4-bit) merges cleanly into deployable full weights;
+        merging a LoRA into a 4-bit base degrades/breaks.
+      - nlp_llm loads the merged dir via AutoModelForCausalLM directly — no PEFT
+        at inference.
+    """
     import torch
     from datasets import Dataset
-    from transformers import AutoTokenizer
+    from peft import LoraConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
     rows = []
@@ -52,18 +63,34 @@ def _train_seq(args):
                             for r in rows])
 
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()  # T4 -> False
+    dtype = torch.bfloat16 if bf16_ok else torch.float16
     tok = AutoTokenizer.from_pretrained(args.student)
+    model = AutoModelForCausalLM.from_pretrained(args.student, dtype=dtype)
+    if torch.cuda.is_available():
+        model.enable_input_require_grads()  # required for grad-checkpoint + LoRA
+
+    lora = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
+                      bias="none", task_type="CAUSAL_LM",
+                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                      "gate_proj", "up_proj", "down_proj"])
+
     cfg = SFTConfig(output_dir=args.out, num_train_epochs=args.epochs,
                     per_device_train_batch_size=args.batch,
                     gradient_accumulation_steps=args.grad_accum,
                     learning_rate=args.lr, warmup_ratio=0.03, lr_scheduler_type="cosine",
-                    logging_steps=10, save_strategy="epoch",
+                    logging_steps=10, save_strategy="no",  # merge+save once at end
                     bf16=bf16_ok, fp16=not bf16_ok,
                     dataloader_num_workers=0,  # avoid container thread/pids cap
+                    gradient_checkpointing=True,
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
                     max_length=args.max_seq_len)
-    trainer = SFTTrainer(model=args.student, args=cfg, train_dataset=ds, processing_class=tok)
+    trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds,
+                         processing_class=tok, peft_config=lora)
     trainer.train()
-    trainer.save_model(args.out)
+    # Merge LoRA into the base and save full weights so nlp_llm loads it directly.
+    merged = trainer.model.merge_and_unload()
+    merged.save_pretrained(args.out)
+    tok.save_pretrained(args.out)
 
 
 def _train_logit(args):
@@ -96,6 +123,8 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--grad-accum", type=int, default=2)
     ap.add_argument("--max-seq-len", type=int, default=2048)
+    ap.add_argument("--lora-r", type=int, default=16)
+    ap.add_argument("--lora-alpha", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=2.0, help="logit-KD softmax temp")
     ap.add_argument("--alpha", type=float, default=0.5, help="logit-KD CE weight")
     args = ap.parse_args()
