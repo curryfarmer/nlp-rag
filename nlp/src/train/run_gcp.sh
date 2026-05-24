@@ -15,6 +15,17 @@ PER_DOC="${PER_DOC:-6}"
 export VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.75}"
 export VLLM_MAX_LEN="${VLLM_MAX_LEN:-4096}"
 export VLLM_BNB="${VLLM_BNB:-1}"
+# Reduce CUDA fragmentation (the OOM error itself suggests this).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# T4-safe QLoRA: batch 1 + short seq keeps the 7B logits upcast (152k vocab) from
+# OOMing in ForCausalLMLoss. Effective batch = BATCH*ACCUM. Bump on a bigger GPU.
+TEACHER_BATCH="${TEACHER_BATCH:-1}"
+TEACHER_ACCUM="${TEACHER_ACCUM:-16}"
+TEACHER_MAXLEN="${TEACHER_MAXLEN:-1024}"
+# Student is tiny but the same 152k-vocab logits upcast OOMs at big batch/seq.
+STUDENT_BATCH="${STUDENT_BATCH:-2}"
+STUDENT_ACCUM="${STUDENT_ACCUM:-8}"
+STUDENT_MAXLEN="${STUDENT_MAXLEN:-1024}"
 DATA=train/data
 CKPT=train/ckpt
 ART=train/artifacts
@@ -53,7 +64,8 @@ fi
 
 echo "== C: finetune teacher (QLoRA) =="
 python train/finetune_teacher.py --base "$TEACHER" $SFT_ARGS \
-    --out "$CKPT/teacher" --merge
+    --batch "$TEACHER_BATCH" --grad-accum "$TEACHER_ACCUM" \
+    --max-seq-len "$TEACHER_MAXLEN" --out "$CKPT/teacher" --merge
 
 echo "== C.5: teacher labels for distillation =="
 # First pass: distil on the same chat data (gold + converted synth). Upgrade later
@@ -63,6 +75,8 @@ cat "$DATA"/sft_dev.jsonl $( [ "$PER_DOC" != "0" ] && echo "$DATA/sft_synth.json
 
 echo "== D: distil student; target proxy >= 0.95 on heldout =="
 python train/distill_student.py --mode seq --student "$STUDENT" \
+    --batch "$STUDENT_BATCH" --grad-accum "$STUDENT_ACCUM" \
+    --max-seq-len "$STUDENT_MAXLEN" \
     --data "$DATA/teacher_labels.jsonl" --out "$CKPT/student"
 NLP_USE_LLM=1 NLP_LLM_MODEL="$CKPT/student" \
     python eval_answers.py --proxy-bem --heldout | tail -8
