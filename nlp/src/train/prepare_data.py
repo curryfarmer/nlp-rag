@@ -87,7 +87,12 @@ def main() -> int:
     n = 0
     with out_path.open("w") as f:
         for r in sel:
-            doc_ids = mgr._retrieve(r["question"], k=args.top_k)
+            # Train-time context MUST contain the answer, else the model learns to
+            # hallucinate. Retrieval@3 misses the gold doc ~5% (eval) / more (synth),
+            # so force the known source_docs in, then top up with retrieved docs.
+            retrieved = mgr._retrieve(r["question"], k=args.top_k)
+            ordered = list(dict.fromkeys((r.get("source_docs") or []) + retrieved))
+            doc_ids = ordered[:max(args.top_k, len(r.get("source_docs") or []))]
             docs = [mgr.doc_text[d] for d in doc_ids if d in mgr.doc_text]
             msgs = _build_messages(r["question"], docs, args.fewshot)
             msgs.append({"role": "assistant", "content": r["answer"]})

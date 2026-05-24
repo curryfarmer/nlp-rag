@@ -51,7 +51,7 @@ def main() -> int:
     # --- lazy heavy imports ---
     import torch
     from datasets import Dataset
-    from peft import LoraConfig
+    from peft import LoraConfig, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     from trl import SFTConfig, SFTTrainer
 
@@ -67,6 +67,9 @@ def main() -> int:
     tok = AutoTokenizer.from_pretrained(args.base)
     model = AutoModelForCausalLM.from_pretrained(
         args.base, quantization_config=bnb, dtype=compute_dtype, device_map="auto")
+    # Required for QLoRA: casts norms to fp32, enables input grads so gradient
+    # checkpointing actually propagates through the frozen 4-bit base.
+    model = prepare_model_for_kbit_training(model)
 
     lora = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
                       bias="none", task_type="CAUSAL_LM",

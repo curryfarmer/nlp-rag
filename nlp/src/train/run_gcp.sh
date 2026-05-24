@@ -62,24 +62,36 @@ if [ "$PER_DOC" != "0" ]; then
     SFT_ARGS="$SFT_ARGS --data $DATA/sft_synth.jsonl"
 fi
 
-echo "== C: finetune teacher (QLoRA) =="
-python train/finetune_teacher.py --base "$TEACHER" $SFT_ARGS \
-    --batch "$TEACHER_BATCH" --grad-accum "$TEACHER_ACCUM" \
-    --max-seq-len "$TEACHER_MAXLEN" --out "$CKPT/teacher" --merge
+# NOTE: this pass distils the student directly on gold+synth chat data; the
+# finetuned teacher is NOT yet used to relabel (that's the next upgrade). So the
+# teacher finetune is optional for a first number -> SKIP_TEACHER=1 to skip the
+# slow 7B step. No --merge: merging a LoRA into a 4-bit base degrades/breaks, and
+# the merged teacher isn't consumed downstream this pass anyway.
+if [ "${SKIP_TEACHER:-0}" != "1" ]; then
+    echo "== C: finetune teacher (QLoRA) =="
+    python train/finetune_teacher.py --base "$TEACHER" $SFT_ARGS \
+        --batch "$TEACHER_BATCH" --grad-accum "$TEACHER_ACCUM" \
+        --max-seq-len "$TEACHER_MAXLEN" --out "$CKPT/teacher"
+else
+    echo "== C: SKIPPED (SKIP_TEACHER=1) =="
+fi
 
 echo "== C.5: teacher labels for distillation =="
-# First pass: distil on the same chat data (gold + converted synth). Upgrade later
-# by relabeling these prompts with the merged teacher.
-cat "$DATA"/sft_dev.jsonl $( [ "$PER_DOC" != "0" ] && echo "$DATA/sft_synth.jsonl" ) \
-    > "$DATA/teacher_labels.jsonl"
+# First pass: distil on the chat data itself (gold + converted synth).
+if [ "$PER_DOC" != "0" ] && [ -s "$DATA/sft_synth.jsonl" ]; then
+    cat "$DATA/sft_dev.jsonl" "$DATA/sft_synth.jsonl" > "$DATA/teacher_labels.jsonl"
+else
+    cp "$DATA/sft_dev.jsonl" "$DATA/teacher_labels.jsonl"
+fi
 
 echo "== D: distil student; target proxy >= 0.95 on heldout =="
 python train/distill_student.py --mode seq --student "$STUDENT" \
     --batch "$STUDENT_BATCH" --grad-accum "$STUDENT_ACCUM" \
     --max-seq-len "$STUDENT_MAXLEN" \
     --data "$DATA/teacher_labels.jsonl" --out "$CKPT/student"
+# Explicitly route eval through the distilled student (env + --llm flag).
 NLP_USE_LLM=1 NLP_LLM_MODEL="$CKPT/student" \
-    python eval_answers.py --proxy-bem --heldout | tail -8
+    python eval_answers.py --proxy-bem --heldout --llm --llm-model "$CKPT/student" | tail -8
 
 echo "== E: quantize to Q4 =="
 python train/quantize.py --mode gguf --model "$CKPT/student" \
