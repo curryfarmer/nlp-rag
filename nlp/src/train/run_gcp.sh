@@ -1,31 +1,35 @@
 #!/usr/bin/env bash
-# Execute the cheese on the GCP GPU box. Run from nlp/src.
-#   cd nlp/src && bash train/run_gcp.sh
-# Phases A/B data are already built locally and committed; this re-builds them on
-# the box (idempotent), then runs the GPU phases C->E and the calibration F.
+# Execute the cheese. Run from nlp/src:  cd nlp/src && bash train/run_gcp.sh
+# Builds SFT data, then GPU phases C->E + calibration F.
+#
+# GPU_PROFILE selects hardware defaults (any value still overridable per-knob):
+#   5090 (default) — RTX 5090 / Blackwell, 32GB, dedicated. bf16, big batch/seq,
+#                    fp16 vllm (no 4-bit needed), high VRAM util.
+#   t4             — shared Tesla T4, 16GB. fp16-only, batch 1 + short seq + 4-bit
+#                    everywhere to survive the cramped, contended card.
 set -euo pipefail
 
 TEACHER="${TEACHER:-Qwen/Qwen2.5-7B-Instruct}"
 STUDENT="${STUDENT:-Qwen/Qwen2.5-0.5B-Instruct}"
 PER_DOC="${PER_DOC:-6}"
-# vllm coexists with other jobs on the shared T4: 4-bit load + enough VRAM for the
-# KV cache. 0.75 of 15GB = ~11.5GB (weights 5.5 + cuda-graphs 1.7 + KV ~4); at 0.5
-# the cache went negative -> vllm dies -> HF 4-bit fallback (slow). Lower only if
-# the co-tenant job grows and vllm hits "free memory < desired".
-export VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.75}"
-export VLLM_MAX_LEN="${VLLM_MAX_LEN:-4096}"
-export VLLM_BNB="${VLLM_BNB:-1}"
-# Reduce CUDA fragmentation (the OOM error itself suggests this).
+GPU_PROFILE="${GPU_PROFILE:-5090}"
+
+if [ "$GPU_PROFILE" = "5090" ]; then
+    # 32GB + bf16 (auto-detected in the trainers): 7B QLoRA at batch 4/seq 2048,
+    # tiny student at batch 8. vllm loads the 7B teacher in fp16 (fits easily) at
+    # high util since the card is dedicated.
+    : "${VLLM_GPU_MEM_UTIL:=0.90}"; : "${VLLM_MAX_LEN:=8192}"; : "${VLLM_BNB:=0}"
+    : "${TEACHER_BATCH:=4}";  : "${TEACHER_ACCUM:=4}";  : "${TEACHER_MAXLEN:=2048}"
+    : "${STUDENT_BATCH:=8}";  : "${STUDENT_ACCUM:=2}";  : "${STUDENT_MAXLEN:=2048}"
+else  # t4
+    : "${VLLM_GPU_MEM_UTIL:=0.75}"; : "${VLLM_MAX_LEN:=4096}"; : "${VLLM_BNB:=1}"
+    : "${TEACHER_BATCH:=1}";  : "${TEACHER_ACCUM:=16}"; : "${TEACHER_MAXLEN:=1024}"
+    : "${STUDENT_BATCH:=2}";  : "${STUDENT_ACCUM:=8}";  : "${STUDENT_MAXLEN:=1024}"
+fi
+export VLLM_GPU_MEM_UTIL VLLM_MAX_LEN VLLM_BNB
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-# T4-safe QLoRA: batch 1 + short seq keeps the 7B logits upcast (152k vocab) from
-# OOMing in ForCausalLMLoss. Effective batch = BATCH*ACCUM. Bump on a bigger GPU.
-TEACHER_BATCH="${TEACHER_BATCH:-1}"
-TEACHER_ACCUM="${TEACHER_ACCUM:-16}"
-TEACHER_MAXLEN="${TEACHER_MAXLEN:-1024}"
-# Student is tiny but the same 152k-vocab logits upcast OOMs at big batch/seq.
-STUDENT_BATCH="${STUDENT_BATCH:-2}"
-STUDENT_ACCUM="${STUDENT_ACCUM:-8}"
-STUDENT_MAXLEN="${STUDENT_MAXLEN:-1024}"
+echo "GPU_PROFILE=$GPU_PROFILE  teacher(b=$TEACHER_BATCH a=$TEACHER_ACCUM L=$TEACHER_MAXLEN)  student(b=$STUDENT_BATCH a=$STUDENT_ACCUM L=$STUDENT_MAXLEN)  vllm(util=$VLLM_GPU_MEM_UTIL bnb=$VLLM_BNB)"
+
 DATA=train/data
 CKPT=train/ckpt
 ART=train/artifacts
@@ -33,10 +37,10 @@ mkdir -p "$DATA" "$CKPT" "$ART"
 
 echo "== deps =="
 pip install -q -r ../requirements-train.txt
-# vllm makes synth ~10-20min instead of hours. It may upgrade torch — if that
-# breaks QLoRA/bitsandbytes, set SKIP_VLLM=1 and gen_synthetic falls back to HF 4-bit.
+# vllm speeds synth a lot. If its torch pin clashes with your Blackwell torch,
+# set SKIP_VLLM=1 and gen_synthetic falls back to HF (4-bit on t4, fp16 on 5090).
 if [ "${SKIP_VLLM:-0}" != "1" ]; then
-    pip install -q vllm || echo "vllm install failed -> HF 4-bit fallback for synth"
+    pip install -q vllm || echo "vllm install failed -> HF fallback for synth"
 fi
 
 echo "== A: baseline proxy (regex-only) =="
