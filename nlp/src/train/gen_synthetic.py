@@ -55,11 +55,16 @@ def _load_teacher(model_id: str):
         from vllm import LLM, SamplingParams  # noqa: F401
         return ("vllm", LLM(model=model_id, dtype="auto"))
     except Exception:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                                  BitsAndBytesConfig)
         import torch
         tok = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16,
-                                                     device_map="auto")
+        # 4-bit load: a 7B teacher in fp16 (~14GB) OOMs a T4 (16GB) once 1024-tok
+        # activations land. nf4 brings it to ~5-6GB. Drop to fp16 on big GPUs.
+        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                 bnb_4bit_compute_dtype=torch.float16)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, quantization_config=bnb, device_map="auto")
         return ("hf", (tok, model))
 
 

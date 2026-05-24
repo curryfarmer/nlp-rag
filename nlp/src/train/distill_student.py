@@ -37,6 +37,7 @@ def load_jsonl(path: str):
 
 def _train_seq(args):
     """Sequence-level KD == SFT on teacher-generated (and gold) chat data."""
+    import torch
     from datasets import Dataset
     from transformers import AutoTokenizer
     from trl import SFTConfig, SFTTrainer
@@ -46,12 +47,14 @@ def _train_seq(args):
         rows.extend(load_jsonl(p))
     ds = Dataset.from_list([{"messages": r["messages"]} for r in rows])
 
+    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()  # T4 -> False
     tok = AutoTokenizer.from_pretrained(args.student)
     cfg = SFTConfig(output_dir=args.out, num_train_epochs=args.epochs,
                     per_device_train_batch_size=args.batch,
                     gradient_accumulation_steps=args.grad_accum,
                     learning_rate=args.lr, warmup_ratio=0.03, lr_scheduler_type="cosine",
-                    logging_steps=10, save_strategy="epoch", bf16=True,
+                    logging_steps=10, save_strategy="epoch",
+                    bf16=bf16_ok, fp16=not bf16_ok,
                     max_seq_length=args.max_seq_len)
     trainer = SFTTrainer(model=args.student, args=cfg, train_dataset=ds, processing_class=tok)
     trainer.train()

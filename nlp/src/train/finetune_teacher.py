@@ -58,12 +58,15 @@ def main() -> int:
     rows = load_jsonl_messages(args.data)
     ds = Dataset.from_list([{"messages": r["messages"]} for r in rows])
 
+    # T4 (Turing) has NO bf16 — use fp16. A100/L4 (Ampere+) can flip these to bf16.
+    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    compute_dtype = torch.bfloat16 if bf16_ok else torch.float16
     bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                             bnb_4bit_compute_dtype=torch.bfloat16,
+                             bnb_4bit_compute_dtype=compute_dtype,
                              bnb_4bit_use_double_quant=True)
     tok = AutoTokenizer.from_pretrained(args.base)
     model = AutoModelForCausalLM.from_pretrained(
-        args.base, quantization_config=bnb, torch_dtype=torch.bfloat16, device_map="auto")
+        args.base, quantization_config=bnb, dtype=compute_dtype, device_map="auto")
 
     lora = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=0.05,
                       bias="none", task_type="CAUSAL_LM",
@@ -74,7 +77,8 @@ def main() -> int:
                     per_device_train_batch_size=args.batch,
                     gradient_accumulation_steps=args.grad_accum,
                     learning_rate=args.lr, warmup_ratio=0.03, lr_scheduler_type="cosine",
-                    logging_steps=10, save_strategy="epoch", bf16=True,
+                    logging_steps=10, save_strategy="epoch",
+                    bf16=bf16_ok, fp16=not bf16_ok,
                     max_seq_length=args.max_seq_len, gradient_checkpointing=True)
 
     trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds,
