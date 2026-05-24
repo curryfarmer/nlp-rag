@@ -55,7 +55,7 @@ def _train_seq(args):
                     learning_rate=args.lr, warmup_ratio=0.03, lr_scheduler_type="cosine",
                     logging_steps=10, save_strategy="epoch",
                     bf16=bf16_ok, fp16=not bf16_ok,
-                    max_seq_length=args.max_seq_len)
+                    max_length=args.max_seq_len)
     trainer = SFTTrainer(model=args.student, args=cfg, train_dataset=ds, processing_class=tok)
     trainer.train()
     trainer.save_model(args.out)
