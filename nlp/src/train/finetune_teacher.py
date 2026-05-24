@@ -56,7 +56,11 @@ def main() -> int:
     from trl import SFTConfig, SFTTrainer
 
     rows = load_jsonl_messages(args.data)
-    ds = Dataset.from_list([{"messages": r["messages"]} for r in rows])
+    # prompt/completion format -> TRL trains loss on the answer only (see
+    # prepare_data.py); a flat messages list trains on the whole sequence and the
+    # doc-length prompt drowns the short answer.
+    ds = Dataset.from_list([{"prompt": r["prompt"], "completion": r["completion"]}
+                            for r in rows])
 
     # T4 (Turing) has NO bf16 — use fp16. A100/L4 (Ampere+) can flip these to bf16.
     bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()

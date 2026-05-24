@@ -94,9 +94,15 @@ def main() -> int:
             ordered = list(dict.fromkeys((r.get("source_docs") or []) + retrieved))
             doc_ids = ordered[:max(args.top_k, len(r.get("source_docs") or []))]
             docs = [mgr.doc_text[d] for d in doc_ids if d in mgr.doc_text]
-            msgs = _build_messages(r["question"], docs, args.fewshot)
-            msgs.append({"role": "assistant", "content": r["answer"]})
-            f.write(json.dumps({"messages": msgs, "key": r.get("key"),
+            # Emit PROMPT/COMPLETION (not a single messages list) so TRL trains
+            # loss on the answer ONLY. With a flat messages list the loss covers
+            # the whole sequence -> the ~3200-token document dwarfs the ~26-char
+            # answer, the model just learns to regurgitate the doc (token-acc
+            # 0.998, but it echoes the document at inference instead of answering).
+            prompt = _build_messages(r["question"], docs, args.fewshot)  # system(+fewshot)+user
+            completion = [{"role": "assistant", "content": r["answer"]}]
+            f.write(json.dumps({"prompt": prompt, "completion": completion,
+                                "key": r.get("key"),
                                 "difficulty": r.get("difficulty")}) + "\n")
             n += 1
     print(f"wrote {n} examples -> {out_path}  (split={args.split}, top_k={args.top_k}, "
