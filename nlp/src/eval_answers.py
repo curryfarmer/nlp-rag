@@ -159,8 +159,12 @@ def get_split() -> dict:
 # --- core eval ---------------------------------------------------------------
 
 
-def evaluate(rows: list[dict], mgr: NLPManager) -> dict:
+def evaluate(rows: list[dict], mgr: NLPManager, use_proxy: bool = False) -> dict:
     preds = mgr.qa_batch([r["question"] for r in rows])
+
+    proxy_equiv = None
+    if use_proxy:
+        from nlp_bem_proxy import equivalent as proxy_equiv  # noqa: F811
 
     per: list[dict] = []
     bucket_stats: dict[str, list[dict]] = defaultdict(list)
@@ -175,6 +179,8 @@ def evaluate(rows: list[dict], mgr: NLPManager) -> dict:
         row_gs = gold_substring(p["answer"], r["answer"])
         row_lp = likely_pass(p["answer"], r["answer"])
         row_loose = loose_pass(p["answer"], r["answer"])
+        row_proxy = (proxy_equiv(p["answer"], r["answer"], r["question"])
+                     if proxy_equiv else None)
         rec = {
             "key": r.get("key"),
             "difficulty": r.get("difficulty"),
@@ -190,6 +196,7 @@ def evaluate(rows: list[dict], mgr: NLPManager) -> dict:
             "gold_substring": row_gs,
             "likely_pass": row_lp,
             "loose_pass": row_loose,
+            "proxy_pass": row_proxy,
         }
         per.append(rec)
         bucket_stats[rec["bucket"]].append(rec)
@@ -219,6 +226,9 @@ def evaluate(rows: list[dict], mgr: NLPManager) -> dict:
 
     summary["est_strict"] = _est("likely_pass")
     summary["est_loose"] = _est("loose_pass")
+    if use_proxy:
+        summary["proxy_pass"] = round(sum(bool(r["proxy_pass"]) for r in per) / n, 4)
+        summary["est_proxy"] = _est("proxy_pass")
 
     by_bucket = {}
     for b, rs in sorted(bucket_stats.items(), key=lambda kv: -len(kv[1])):
@@ -291,6 +301,8 @@ def main() -> int:
     ap.add_argument("--heldout", action="store_true")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--by-bucket", action="store_true")
+    ap.add_argument("--proxy-bem", action="store_true",
+                    help="Score answers with nlp_bem_proxy (BEM-style equivalence proxy).")
     ap.add_argument("--dump", help="write misses (likely_pass=False) to this json file")
     ap.add_argument("--rerank", action="store_true",
                     help="Enable cross-encoder reranker (sets NLP_USE_RERANK=1).")
@@ -339,7 +351,7 @@ def main() -> int:
         sel = [rows[i] for i in idx]
         label = "HELDOUT" if args.heldout else "DEV"
 
-    out = evaluate(sel, mgr)
+    out = evaluate(sel, mgr, use_proxy=args.proxy_bem)
     s = out["summary"]
     print(f"\n=== {label} ({s['n']} rows) ===")
     print(f"  retrieval@3        = {s['retrieval_top3']}")
@@ -348,6 +360,8 @@ def main() -> int:
     print(f"  gold⊆pred or rev   = {s['gold_substring']}")
     print(f"  LIKELY pass (strict)= {s['likely_pass']}  -> est = {s['est_strict']}")
     print(f"  LOOSE  pass        = {s['loose_pass']}  -> est = {s['est_loose']}")
+    if args.proxy_bem:
+        print(f"  PROXY-BEM pass     = {s['proxy_pass']}  -> est = {s['est_proxy']}")
 
     print("\n  By difficulty:")
     for d, v in out["by_difficulty"].items():

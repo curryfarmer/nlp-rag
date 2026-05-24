@@ -1,0 +1,14 @@
+# Training-only deps (GCP GPU box). NOT in the inference Docker image.
+# Install: pip install -r nlp/requirements-train.txt
+torch>=2.3            # CUDA build on GPU box
+transformers>=4.46
+trl>=0.12
+peft>=0.13
+datasets>=3.0
+accelerate>=1.0
+bitsandbytes>=0.44    # QLoRA 4-bit (CUDA only — no CPU/mac)
+sentencepiece
+# optional, faster paths:
+# unsloth             # 2x faster QLoRA, less VRAM
+# vllm                # high-throughput synthetic generation (gen_synthetic.py)
+# autoawq             # AWQ Q4 export (quantize.py --mode awq)
