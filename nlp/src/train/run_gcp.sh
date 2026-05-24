@@ -18,9 +18,12 @@ if [ "$GPU_PROFILE" = "5090" ]; then
     # 32GB + bf16 (auto-detected in the trainers): 7B QLoRA at batch 4/seq 2048,
     # tiny student at batch 8. vllm loads the 7B teacher in fp16 (fits easily) at
     # high util since the card is dedicated.
+    # NB: Qwen2.5 has a 152k vocab -> the loss logits tensor is batch*seq*152k.
+    # Big batch OOMs even 32GB (batch8*seq2048 logits+upcast ~= 9GB+). Keep
+    # batch*seq modest; grad-accum recovers effective batch.
     : "${VLLM_GPU_MEM_UTIL:=0.90}"; : "${VLLM_MAX_LEN:=8192}"; : "${VLLM_BNB:=0}"
-    : "${TEACHER_BATCH:=4}";  : "${TEACHER_ACCUM:=4}";  : "${TEACHER_MAXLEN:=2048}"
-    : "${STUDENT_BATCH:=8}";  : "${STUDENT_ACCUM:=2}";  : "${STUDENT_MAXLEN:=2048}"
+    : "${TEACHER_BATCH:=2}";  : "${TEACHER_ACCUM:=8}";  : "${TEACHER_MAXLEN:=2048}"
+    : "${STUDENT_BATCH:=4}";  : "${STUDENT_ACCUM:=4}";  : "${STUDENT_MAXLEN:=2048}"
 else  # t4
     : "${VLLM_GPU_MEM_UTIL:=0.75}"; : "${VLLM_MAX_LEN:=4096}"; : "${VLLM_BNB:=1}"
     : "${TEACHER_BATCH:=1}";  : "${TEACHER_ACCUM:=16}"; : "${TEACHER_MAXLEN:=1024}"
