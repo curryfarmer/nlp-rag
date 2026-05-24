@@ -8,8 +8,12 @@ set -euo pipefail
 TEACHER="${TEACHER:-Qwen/Qwen2.5-7B-Instruct}"
 STUDENT="${STUDENT:-Qwen/Qwen2.5-0.5B-Instruct}"
 PER_DOC="${PER_DOC:-6}"
-# vllm coexists with other jobs on the shared T4: cap its VRAM share + 4-bit load.
-export VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.55}"
+# vllm coexists with other jobs on the shared T4: 4-bit load + enough VRAM for the
+# KV cache. 0.75 of 15GB = ~11.5GB (weights 5.5 + cuda-graphs 1.7 + KV ~4); at 0.5
+# the cache went negative -> vllm dies -> HF 4-bit fallback (slow). Lower only if
+# the co-tenant job grows and vllm hits "free memory < desired".
+export VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.75}"
+export VLLM_MAX_LEN="${VLLM_MAX_LEN:-4096}"
 export VLLM_BNB="${VLLM_BNB:-1}"
 DATA=train/data
 CKPT=train/ckpt
@@ -29,20 +33,33 @@ python eval_answers.py --proxy-bem | tail -8
 
 echo "== B: build SFT data =="
 python train/prepare_data.py --out "$DATA/sft_dev.jsonl" --top-k 3
-python train/gen_synthetic.py --teacher "$TEACHER" --per-doc "$PER_DOC" \
-    --out "$DATA/synth.jsonl"
-# TODO: filter synth.jsonl with nlp_bem_proxy (drop ungrounded answers).
+
+# finetune/distill consume CHAT format ({messages}). gold dev is already chat;
+# raw synth ({question,answer,source_docs}) MUST be converted or finetune dies
+# with KeyError: 'messages'.
+SFT_ARGS="--data $DATA/sft_dev.jsonl"
+if [ "$PER_DOC" != "0" ]; then
+    if [ -s "$DATA/synth.jsonl" ]; then
+        echo "  reusing existing $DATA/synth.jsonl (skip generation)"
+    else
+        python train/gen_synthetic.py --teacher "$TEACHER" --per-doc "$PER_DOC" \
+            --out "$DATA/synth.jsonl"
+    fi
+    # TODO: filter synth.jsonl with nlp_bem_proxy (drop ungrounded answers).
+    python train/prepare_data.py --synth-in "$DATA/synth.jsonl" \
+        --out "$DATA/sft_synth.jsonl" --top-k 3
+    SFT_ARGS="$SFT_ARGS --data $DATA/sft_synth.jsonl"
+fi
 
 echo "== C: finetune teacher (QLoRA) =="
-python train/finetune_teacher.py --base "$TEACHER" \
-    --data "$DATA/sft_dev.jsonl" --data "$DATA/synth.jsonl" \
+python train/finetune_teacher.py --base "$TEACHER" $SFT_ARGS \
     --out "$CKPT/teacher" --merge
 
 echo "== C.5: teacher labels for distillation =="
-# Relabel every dev+synth prompt with the finetuned teacher -> teacher_labels.jsonl.
-# (Generate with the merged teacher; reuse gen_synthetic backend or a small script.)
-# Placeholder: distil directly on gold dev for the first pass.
-cp "$DATA/sft_dev.jsonl" "$DATA/teacher_labels.jsonl"
+# First pass: distil on the same chat data (gold + converted synth). Upgrade later
+# by relabeling these prompts with the merged teacher.
+cat "$DATA"/sft_dev.jsonl $( [ "$PER_DOC" != "0" ] && echo "$DATA/sft_synth.jsonl" ) \
+    > "$DATA/teacher_labels.jsonl"
 
 echo "== D: distil student; target proxy >= 0.95 on heldout =="
 python train/distill_student.py --mode seq --student "$STUDENT" \

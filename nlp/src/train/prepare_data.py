@@ -62,14 +62,22 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=3, help="docs retrieved per question")
     ap.add_argument("--fewshot", action="store_true", help="embed style exemplars in prompt")
     ap.add_argument("--split", choices=["dev", "heldout", "all"], default="dev")
+    ap.add_argument("--synth-in", help="convert raw synth pairs "
+                    "({question,answer,source_docs}) to chat format instead of the eval split")
     args = ap.parse_args()
 
-    rows = _load_eval()
-    split = json.loads(SPLIT_PATH.read_text())
-    if args.split == "all":
-        sel = rows
+    if args.synth_in:
+        # gen_synthetic emits raw QA pairs (same fields as eval rows minus 'key');
+        # process them through the identical retrieval + prompt builder.
+        sel = [json.loads(l) for l in Path(args.synth_in).read_text().splitlines()
+               if l.strip()]
     else:
-        sel = [rows[i] for i in split[args.split]]
+        rows = _load_eval()
+        split = json.loads(SPLIT_PATH.read_text())
+        if args.split == "all":
+            sel = rows
+        else:
+            sel = [rows[i] for i in split[args.split]]
 
     mgr = NLPManager()
     mgr.load_corpus(_load_corpus())
