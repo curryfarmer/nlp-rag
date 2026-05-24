@@ -313,8 +313,9 @@ def main() -> int:
     ap.add_argument("--llm-top-k", type=int, default=None)
     ap.add_argument("--llm-model", default=None)
     ap.add_argument("--candidate-coverage", action="store_true",
-                    help="Skip scoring; report what % of dev rows have gold (or substring) "
-                         "in the regex-generated candidate set. Diagnoses recall ceiling.")
+                    help="Skip scoring; report the fraction of dev rows that have gold "
+                         "(or substring) in the regex-generated candidate set. "
+                         "Diagnoses recall ceiling.")
     args = ap.parse_args()
 
     if args.rerank:
