@@ -18,4 +18,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY models ./models
 COPY src .
 
+# Inference runs OFFLINE — never let HF try to reach the network.
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+
+# Answer mode. Default = regex-only (no model needed, fully offline).
+# To serve the distilled student instead: drop its weights in models/student,
+# then uncomment the three lines below (NLP_LLM_MODEL is relative to /workspace).
+# ENV NLP_USE_LLM=1
+# ENV NLP_LLM_MODEL=models/student
+# ENV NLP_LLM_TOP_K=3
+
 CMD uvicorn nlp_server:app --port 5004 --host 0.0.0.0

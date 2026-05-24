@@ -1,0 +1,5 @@
+# trained artifacts + bundled weights live on the GCP box, not git
+models/*
+!models/.gitkeep
+src/train/ckpt/
+src/train/artifacts/
